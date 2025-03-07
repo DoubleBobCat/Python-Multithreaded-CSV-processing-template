@@ -1,6 +1,6 @@
 # FILE
 import config
-import snp.script.custom_func as custom_func
+import custom_func
 # MODULE
 import pandas as pd
 import time
@@ -11,32 +11,67 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 from typing import Tuple
 from prettytable import PrettyTable
+import queue
+import threading
+from typing import Any
 
 
 # [OK]
 def signal_handler(sig, frame):
     """Process stop signal"""
-    global force_exit
-    force_exit = True
+    config.force_exit = True
     print("\nGet Exit signal, Exiting...")
     sys.exit(1)
 
 
 # [OK]
-def update_progress(file: str, process_add: int) -> None:
-    """Update progress data"""
-    # Update Process
-    with config.status_data_lock:
-        now_processed_count = config.status_data_dict[file]["processed_count"] + process_add
-        config.status_data_dict[file].update({
-            "processed_count": now_processed_count
-        })
-    # Print
-    print_progress_table()
+def update_progress(file_name: str, argA: Any, argB: Any = False) -> None:
+    # [OK]
+    def update_progressA(file_name: str, process_add: int, data: str) -> None:
+        """Update progress data"""
+        # Update Process
+        with config.status_data_lock:
+            now_processed_count = config.status_data_dict[file_name]["processed_count"] + process_add
+            config.status_data_dict[file_name].update({
+                "processed_count": now_processed_count,
+                "data": data
+            })
+        # Print
+        print_progress_table()
 
+    # [OK]
+    def update_progressB(file_name: str, upate_data: dict, enforce: bool) -> None:
+        # Update Process
+        with config.status_data_lock:
+            config.status_data_dict[file_name].update(upate_data)
+        # Print
+        print_progress_table(enforce)
+
+    if type(argA) == int:
+        update_progressA(file_name, argA, argB)
+    elif type(argA) == dict:
+        update_progressB(file_name, argA, argB)
+    else:
+        print(
+            f"ERROR: UnExcept Exception in update_progress({file_name},{argA},{argB})")
+        config.force_exit = True
+        exit(2)
     # Check Exit
-    if force_exit:
+    if config.force_exit:
         sys.exit(1)
+
+
+# [OK]
+def update_progress_queue():
+    """Update progress data queue"""
+    while not config.force_exit:
+        try:
+            args = config.update_progress_queue.get(timeout=0.5)
+            if args is None:
+                break
+            update_progress(*args)
+        except queue.Empty:
+            continue
 
 
 # [OK]
@@ -64,7 +99,7 @@ def format_progress_times(elapsed_time: float, remaining_time: float) -> Tuple[s
 def print_progress_table(enforce: bool = False) -> None:
     """Print Progress table"""
     now_time = time.time()
-    
+
     with config.print_lock:
         if ((now_time - config.last_print) > config.BASIC_CONFIG["PRINT_INTERVAL_SECONDS"]) or enforce:
             # Init Progress table
@@ -79,7 +114,7 @@ def print_progress_table(enforce: bool = False) -> None:
                     this_elapsed_time = now_time - \
                         file_status_data["this_start_time"]
 
-                    if file_status_data["status"] != 3:
+                    if (file_status_data["status"] != 3) and (file_status_data["status"] != -1):
                         # Calculate Processing ETH
                         processed_count = file_status_data["processed_count"]
                         all_count = file_status_data["all_count"]
@@ -106,6 +141,7 @@ def print_progress_table(enforce: bool = False) -> None:
                         config.BASIC_CONFIG["STATUS_CODE"][file_status_data["status"]]
                     ])
             print(tb)
+            config.last_print = time.time()
 
 
 # [OK]
@@ -144,6 +180,13 @@ def process_csv_file(input_path, output_path):
     df = pd.read_csv(input_path)
     file_name = os.path.basename(input_path)
 
+    # Echo
+    INFO_str = f"INFO: Begin Process {file_name}"
+    print(INFO_str)
+    if config.INFO_FILE != None:
+        with config.INFO_FILE_f_lock:
+            config.INFO_FILE_f.write(INFO_str + "\n")
+
     # Get DF basic info
     column_names = df.columns
     row_count = len(df.index)
@@ -161,7 +204,7 @@ def process_csv_file(input_path, output_path):
     all_count = act_row_count * act_col_count
 
     # Init Processing tracker
-    if config.BASIC_CONFIG["TRACK_SWITH"]:
+    if config.BASIC_CONFIG["TRACK_SWITCH"]:
         with config.status_data_lock:
             config.status_data_dict[file_name] = {
                 "start_time": time.time(),
@@ -172,10 +215,11 @@ def process_csv_file(input_path, output_path):
                 "data": "\\",
                 "status": 0
             }
-        print_progress_table()
+        print_progress_table(True)
 
     # Pre Processing
-    df = custom_func.pre_processing(df, column_names, False)
+    df = custom_func.pre_processing(
+        df, file_name, column_names, all_count, False)
 
     # Shard DataFrame
     row_chunk_list = get_shard(
@@ -190,48 +234,64 @@ def process_csv_file(input_path, output_path):
     )
 
     # Begin Processing
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=config.CSV_PROCESS_MAX_THREAD) as executor:
         try:
             # Init Thread Pool
             thread_pool = []
 
+            # Init output dataframe
+            processed_df = df.copy()
+
             # Update tracker info
-            if config.BASIC_CONFIG["TRACK_SWITH"]:
-                with config.status_data_lock:
-                    config.status_data_dict[file_name].update({
+            if config.BASIC_CONFIG["TRACK_SWITCH"]:
+                config.update_progress_queue.put((
+                    file_name,
+                    {
                         "processed_count": 0,
-                        "this_start": time.time(),
+                        "this_start_time": time.time(),
                         "status": 1
-                    })
-                print_progress_table()
+                    }
+                ))
             # Add Thread to pool
             for row_begin, row_end in row_chunk_list:
                 for col_begin, col_end in col_chunk_list:
-                    df_shard = df.iloc[row_begin:row_end, col_begin:col_end]
+                    df_shard = df.iloc[row_begin:row_end +
+                                       1, col_begin:col_end+1]
                     future = executor.submit(
                         custom_func.processing,
-                        df_shard
+                        df_shard,
+                        file_name,
+                        {
+                            "row_begin": row_begin,
+                            "row_end": row_end,
+                            "col_begin": col_begin,
+                            "col_end": col_end
+                        },
+                        column_names
                     )
                     thread_pool.append(future)
 
             # Finished
-            processed_df = pd.DataFrame()
             for future in as_completed(thread_pool):
-                if force_exit:
-                    return
                 processed_shard = future.result()
-                processed_df.loc[processed_shard.index,
-                                 processed_shard.columns] = processed_shard
+                row_idx = processed_shard.index.intersection(
+                    processed_df.index)
+                col_idx = processed_shard.columns.intersection(
+                    processed_df.columns)
+                if not row_idx.empty and not col_idx.empty:
+                    processed_df.loc[row_idx,
+                                     col_idx] = processed_shard.loc[row_idx, col_idx]
 
             # Update tracker info
-            if config.BASIC_CONFIG["TRACK_SWITH"]:
-                with config.status_data_lock:
-                    config.status_data_dict[file_name].update({
+            if config.BASIC_CONFIG["TRACK_SWITCH"]:
+                config.update_progress_queue.put((
+                    file_name,
+                    {
                         "processed_count": 0,
-                        "this_start": time.time(),
+                        "this_start_time": time.time(),
                         "status": 2
-                    })
-                print_progress_table()
+                    }
+                ))
             # Post Process
             processed_df = custom_func.post_processing(
                 processed_df, None, False)
@@ -239,18 +299,22 @@ def process_csv_file(input_path, output_path):
             # Save DataFrame
             processed_df.to_csv(output_path, index=False)
             # Update tracker info
-            if config.BASIC_CONFIG["TRACK_SWITH"]:
-                with config.status_data_lock:
-                    config.status_data_dict[file_name].update({
-                        "this_start": time.time(),
+            if config.BASIC_CONFIG["TRACK_SWITCH"]:
+                this_time = time.time()
+                config.update_progress_queue.put((
+                    file_name,
+                    {
+                        "this_start_time": this_time,
                         "finished_elapsed_time_str": format_time2str(
-                            time.time() -
+                            this_time -
                             config.status_data_dict[file_name]["start_time"]
                         ),
+                        "processed_count": all_count,
                         "data": "\\",
                         "status": 3
-                    })
-                print_progress_table()
+                    },
+                    True
+                ))
 
         except Exception as e:
             ERROR_str = f"Error processing {file_name}: {e}"
@@ -258,7 +322,7 @@ def process_csv_file(input_path, output_path):
             if config.ERROR_FILE != None:
                 with config.ERROR_FILE_f_lock:
                     config.ERROR_FILE_f.write(ERROR_str + "\n")
-
+            return
 
 
 # [OK]
@@ -271,6 +335,11 @@ def main():
     # Set Stop Signal
     signal.signal(signal.SIGINT, signal_handler)
 
+    # Init data progress thread
+    processing_thread = threading.Thread(target=update_progress_queue)
+    processing_thread.daemon = True
+    processing_thread.start()
+
     # Ignore Unnecessary Warning
     warnings.simplefilter(action='ignore', category=FutureWarning)
 
@@ -282,7 +351,7 @@ def main():
             " does not exist"
         )
         return 1
-    os.makedirs(config.BASIC_CONFIG["DATA_OUT_DIR"], exist_ok=True)
+    os.makedirs(config.BASIC_CONFIG["DATA_OUTPUT_DIR"], exist_ok=True)
 
     # Process All CSV File
     csv_files = []
@@ -350,7 +419,7 @@ def main():
     print("*** *** *** *** ***")
 
     # Begin Processing
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=config.FILE_MAX_THREAD) as executor:
         try:
             # Init Thread Pool
             thread_pool = []
@@ -363,12 +432,12 @@ def main():
                 )
                 if file_rename == None:
                     output_path = os.path.join(
-                        config.BASIC_CONFIG["DATA_OUT_DIR"],
+                        config.BASIC_CONFIG["DATA_OUTPUT_DIR"],
                         file_name
                     )
                 else:
                     output_path = os.path.join(
-                        config.BASIC_CONFIG["DATA_OUT_DIR"],
+                        config.BASIC_CONFIG["DATA_OUTPUT_DIR"],
                         file_rename[file_name]
                     )
 
@@ -381,9 +450,43 @@ def main():
 
             # Finished
             for future in as_completed(thread_pool):
-                if force_exit:
+                if config.force_exit:
                     break
                 future.result()
+
+            # Summary
+            INFO_str = "INFO: All files processed successfully, Wating for summary."
+            print(INFO_str)
+            if config.BASIC_CONFIG["TRACK_SWITCH"]:
+                while not config.update_progress_queue.empty:
+                    continue
+                with config.status_data_lock:
+                    summary = {
+                        "start_time": time.time(),
+                        "this_start_time": 0,
+                        "finished_elapsed_time_str": None,
+                        "processed_count": 0,
+                        "all_count": 0,
+                        "data": "\\",
+                        "status": -1
+                    }
+                    for file_name in config.status_data_dict.keys():
+                        summary["start_time"] = min(
+                            summary["start_time"],
+                            config.status_data_dict[file_name]["start_time"]
+                        )
+                        summary["this_start_time"] = max(
+                            summary["this_start_time"],
+                            config.status_data_dict[file_name]["this_start_time"]
+                        )
+                        summary["all_count"] += config.status_data_dict[file_name]["all_count"]
+                    summary["processed_count"] = summary["all_count"]
+                    summary["finished_elapsed_time_str"] = format_time2str(
+                        summary["this_start_time"] -
+                        summary["start_time"]
+                    )
+                    config.status_data_dict["All"] = summary
+                print_progress_table(True)
 
             INFO_str = "INFO: All files processed successfully."
             print(INFO_str)
