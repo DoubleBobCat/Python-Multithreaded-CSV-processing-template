@@ -165,7 +165,7 @@ def get_shard(begin: int, end: int, shard_count: int) -> list:
         chunk_begin = begin + i * per_chunk
         chunk_end = min(begin + (i + 1) * per_chunk - 1, end)
 
-        if chunk_begin >= chunk_end:
+        if chunk_begin > chunk_end:
             # Wtf, Real Need This IF?
             continue
 
